@@ -245,6 +245,42 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.splitk              = split;
     AiterAsmKernel* impl_ptr = get_or_load_kernel(name, config_map, SUBM, SUBN);
 
+    // The asm kernels load a full SUBM-row tile of A unconditionally -- there is no
+    // predicate on args.M for the A loads. (The *store* side is predicated, so the
+    // results are already correct; only the loads run past the end of A.) When M is
+    // smaller than the tile, those reads go past A's allocation, and whether that
+    // faults depends purely on where the caching allocator happened to place A. That
+    // is why it surfaces as a shape-dependent "Memory access fault by GPU node"
+    // instead of a clean error: e.g. M=1,N=1536,K=128 faults while M=2..31 -- equally
+    // out of bounds -- happen to land on mapped pages. See ROCm/aiter#5781.
+    //
+    // Note the kernels ignore stride_A0 for row addressing (stride_A1 is never set
+    // either; the layout is assumed packed), so zeroing the stride does not help.
+    // Stage A into a zero-padded SUBM-row buffer instead. This is bounded by
+    // SUBM * K elements (SUBM is the selected kernel's tileM: <= 160 on gfx942,
+    // <= 256 on gfx950), so it is negligible next to the N * K B operand.
+    std::optional<AiterTensor> padded_A;
+    if(Mdim < static_cast<int>(SUBM))
+    {
+        const size_t row_bytes = static_cast<size_t>(Kdim) * A->element_size();
+        padded_A               = AiterTensor::zeros(
+            {static_cast<int64_t>(SUBM), static_cast<int64_t>(Kdim)},
+            A->dtype(),
+            A->device_id,
+            stream);
+        // 2D copy: A's rows may be strided, the staging buffer is packed.
+        HIP_CALL(hipMemcpy2DAsync(padded_A->ptr,
+                                  row_bytes,
+                                  A->ptr,
+                                  static_cast<size_t>(args.stride_A0),
+                                  row_bytes,
+                                  static_cast<size_t>(Mdim),
+                                  hipMemcpyDeviceToDevice,
+                                  stream));
+        args.ptr_A     = padded_A->ptr;
+        args.stride_A0 = row_bytes;
+    }
+
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
     int gdz = split;
