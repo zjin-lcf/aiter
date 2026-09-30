@@ -4,8 +4,10 @@
 #include "aiter_ctypes_error.h"
 #include "asm_bf16gemm_configs.hpp"
 #include <cmath>
+#include <cstdint>
 #include <memory>
-#include <optional>
+#include <mutex>
+#include <vector>
 #include <hip/hip_runtime.h>
 
 struct __attribute__((packed)) KernelArgs
@@ -189,6 +191,55 @@ AiterAsmKernel* get_or_load_kernel(const std::string& selectedKernelName,
     return &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
 }
 
+namespace
+{
+// One packed staging tile per device, stream, element size and K. Never freed:
+// a captured graph holds the pointer. A larger tile allocates another buffer.
+struct APadBuf
+{
+    int device;
+    uintptr_t stream;
+    size_t elem;
+    int k;
+    int rows;
+    int live; // [live, rows) is zero. [0, live) may hold a previous A.
+    bool captured;
+    void* ptr;
+};
+
+std::mutex apad_mu;
+std::vector<APadBuf> apad_bufs;
+
+// Caller holds apad_mu. `fresh` means the new tile is already being zeroed.
+APadBuf& apad_buffer(int device,
+                     hipStream_t stream,
+                     size_t elem,
+                     int k,
+                     int rows,
+                     size_t row_bytes,
+                     bool& fresh)
+{
+    fresh                    = false;
+    const uintptr_t stream_k = reinterpret_cast<uintptr_t>(stream);
+    APadBuf* best            = nullptr;
+    for(auto& buf : apad_bufs)
+    {
+        if(buf.device == device && buf.stream == stream_k && buf.elem == elem && buf.k == k &&
+           buf.rows >= rows && (best == nullptr || buf.rows < best->rows))
+            best = &buf;
+    }
+    if(best != nullptr)
+        return *best;
+
+    void* ptr = nullptr;
+    HIP_CALL(hipMalloc(&ptr, row_bytes * static_cast<size_t>(rows)));
+    HIP_CALL(hipMemsetAsync(ptr, 0, row_bytes * static_cast<size_t>(rows), stream));
+    apad_bufs.push_back(APadBuf{device, stream_k, elem, k, rows, 0, false, ptr});
+    fresh = true;
+    return apad_bufs.back();
+}
+} // namespace
+
 AITER_CTYPES_ERROR_DEF
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
@@ -244,6 +295,73 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         Mdim, Ndim, Kdim, config_map, arch_id, bpreshuffle, args.add_bias, splitK, kernelName);
     args.splitk              = split;
     AiterAsmKernel* impl_ptr = get_or_load_kernel(name, config_map, SUBM, SUBN);
+
+    // The asm kernels load a full SUBM-row tile of A. Stores are predicated on M,
+    // so the extra rows do not change the result, but the loads are not predicated.
+    // The A buffer starts at stride_A0 * M bytes and the K prologue shrinks that;
+    // a record count of 0 turns the bound off and the extra rows fault
+    // (ROCm/aiter#5781). Stage a packed tile with a zero tail instead.
+    //
+    // The tile is reused. While M does not shrink, only the live rows are copied.
+    // A captured launch always clears its own tail, so replay does not depend on
+    // zeros left behind by an earlier shape.
+    std::unique_lock<std::mutex> pad_lock(apad_mu, std::defer_lock);
+    if(Mdim < static_cast<int>(SUBM))
+    {
+        const size_t row_bytes = static_cast<size_t>(Kdim) * A->element_size();
+        pad_lock.lock();
+        bool fresh  = false;
+        APadBuf& pad = apad_buffer(A->device_id,
+                                   stream,
+                                   A->element_size(),
+                                   Kdim,
+                                   static_cast<int>(SUBM),
+                                   row_bytes,
+                                   fresh);
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        hipError_t capture_err       = hipStreamIsCapturing(stream, &capture);
+        if(capture_err == hipSuccess && capture == hipStreamCaptureStatusActive)
+            pad.captured = true;
+        else if(capture_err != hipSuccess)
+            (void)hipGetLastError();
+        if(!fresh && (pad.captured || pad.live > Mdim))
+        {
+            const int clear_end = pad.captured ? static_cast<int>(SUBM) : pad.live;
+            if(clear_end > Mdim)
+            {
+                HIP_CALL(hipMemsetAsync(static_cast<char*>(pad.ptr) +
+                                            row_bytes * static_cast<size_t>(Mdim),
+                                        0,
+                                        row_bytes * static_cast<size_t>(clear_end - Mdim),
+                                        stream));
+            }
+        }
+        if(Mdim > 0)
+        {
+            if(static_cast<size_t>(args.stride_A0) == row_bytes)
+            {
+                HIP_CALL(hipMemcpyAsync(pad.ptr,
+                                        A->ptr,
+                                        row_bytes * static_cast<size_t>(Mdim),
+                                        hipMemcpyDeviceToDevice,
+                                        stream));
+            }
+            else
+            {
+                HIP_CALL(hipMemcpy2DAsync(pad.ptr,
+                                          row_bytes,
+                                          A->ptr,
+                                          static_cast<size_t>(args.stride_A0),
+                                          row_bytes,
+                                          static_cast<size_t>(Mdim),
+                                          hipMemcpyDeviceToDevice,
+                                          stream));
+            }
+        }
+        pad.live       = Mdim;
+        args.ptr_A     = pad.ptr;
+        args.stride_A0 = static_cast<unsigned int>(row_bytes);
+    }
 
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
